@@ -18,6 +18,8 @@ struct Config {
     port: u16,
     #[arg(short, long, default_value = "1000")]
     capacity: usize,
+    #[arg(short, long, default_value = "4")]
+    pub workers: usize,
     #[arg(long)]
     verbose: bool,
 }
@@ -34,15 +36,26 @@ async fn main() -> Result<()> {
     let metrics = Arc::new(metrics::Metrics::new());
     let (tx, rx) = mpsc::channel(config.capacity);
 
-    worker::start_worker(rx, Arc::clone(&aggregator), Arc::clone(&metrics));
     metrics::start_reporter(Arc::clone(&metrics));
 
     info!(
         port = config.port,
         capacity = config.capacity,
+        workers = config.workers,
         verbose = config.verbose,
         "starting distributed-log-processor"
     );
 
-    server::run(config.port, tx).await
+    if config.workers <= 1 {
+        worker::start_worker(rx, Arc::clone(&aggregator), Arc::clone(&metrics));
+        server::run(config.port, tx, None).await
+    } else {
+        let pool = worker::start_sharded_pool(
+            config.workers,
+            Arc::clone(&aggregator),
+            Arc::clone(&metrics),
+            config.capacity,
+        );
+        server::run(config.port, tx, Some(pool)).await
+    }
 }
