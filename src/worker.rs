@@ -14,12 +14,38 @@ use tokio::sync::mpsc::Receiver;
 use tracing::debug;
 
 use crate::aggregator::Aggregator;
+use crate::aggregator_mutex::MutexAggregator;
 use crate::message::LogEntry;
 use crate::metrics::Metrics;
 
+pub trait Processable: Send + Sync {
+    fn process(&self, entry: &LogEntry);
+    fn account_count(&self) -> usize;
+}
+
+impl Processable for Aggregator {
+    fn process(&self, entry: &LogEntry) {
+        Aggregator::process(self, entry);
+    }
+
+    fn account_count(&self) -> usize {
+        Aggregator::account_count(self)
+    }
+}
+
+impl Processable for MutexAggregator {
+    fn process(&self, entry: &LogEntry) {
+        MutexAggregator::process(self, entry);
+    }
+
+    fn account_count(&self) -> usize {
+        MutexAggregator::account_count(self)
+    }
+}
+
 pub fn start_worker(
     mut rx: Receiver<LogEntry>,
-    aggregator: Arc<Aggregator>,
+    aggregator: Arc<dyn Processable + Send + Sync>,
     metrics: Arc<Metrics>,
 ) {
     tokio::spawn(async move {
@@ -53,7 +79,7 @@ impl ShardedPool {
 
 pub fn start_sharded_pool(
     worker_count: usize,
-    aggregator: Arc<Aggregator>,
+    aggregator: Arc<dyn Processable + Send + Sync>,
     metrics: Arc<Metrics>,
     capacity: usize,
 ) -> Arc<ShardedPool> {

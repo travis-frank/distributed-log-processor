@@ -1,4 +1,5 @@
 mod aggregator;
+mod aggregator_mutex;
 mod message;
 mod metrics;
 mod server;
@@ -7,10 +8,16 @@ mod worker;
 use std::sync::Arc;
 
 use anyhow::Result;
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use tokio::sync::mpsc;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
+
+#[derive(Debug, Clone, ValueEnum)]
+enum AggregatorMode {
+    Dashmap,
+    Mutex,
+}
 
 #[derive(Debug, Parser)]
 struct Config {
@@ -20,6 +27,8 @@ struct Config {
     capacity: usize,
     #[arg(short, long, default_value = "4")]
     pub workers: usize,
+    #[arg(long, value_enum, default_value = "dashmap")]
+    aggregator: AggregatorMode,
     #[arg(long)]
     verbose: bool,
 }
@@ -32,7 +41,10 @@ async fn main() -> Result<()> {
         .with_env_filter(EnvFilter::new(if config.verbose { "debug" } else { "info" }))
         .init();
 
-    let aggregator = Arc::new(aggregator::Aggregator::new());
+    let aggregator: Arc<dyn worker::Processable + Send + Sync> = match config.aggregator.clone() {
+        AggregatorMode::Dashmap => Arc::new(aggregator::Aggregator::new()),
+        AggregatorMode::Mutex => Arc::new(aggregator_mutex::MutexAggregator::new()),
+    };
     let metrics = Arc::new(metrics::Metrics::new());
     let (tx, rx) = mpsc::channel(config.capacity);
 
@@ -42,6 +54,7 @@ async fn main() -> Result<()> {
         port = config.port,
         capacity = config.capacity,
         workers = config.workers,
+        aggregator = ?config.aggregator,
         verbose = config.verbose,
         "starting distributed-log-processor"
     );
