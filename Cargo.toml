@@ -3,6 +3,18 @@ name = "distributed-log-processor"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+name = "distributed_log_processor"
+path = "src/lib.rs"
+
+[[bin]]
+name = "distributed-log-processor"
+path = "src/main.rs"
+
+[[bench]]
+name = "processing"
+harness = false
+
 [dependencies]
 tokio      = { version = "1", features = ["full"] }
 dashmap    = "5"
@@ -14,6 +26,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 chrono     = { version = "0.4", features = ["serde"] }
 crossbeam-channel = "0.5"
 anyhow     = "1"
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
 
 [profile.release]
 opt-level = 3
