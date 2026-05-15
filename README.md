@@ -39,17 +39,19 @@ contention entirely.
 
 ---
 
-## Results (Intel i5-1030NG7, 4 cores, 8GB RAM)
+## Results (Apple M1, 8 cores, 16GB RAM)
 
-**Throughput:** 13,757 msg/sec sustained across 10,000 concurrent connections, 0% error rate
+**Peak throughput:** 1,000,000 msg/sec sustained (8 workers, 5,000 concurrent clients)
 
-**Latency:** 0.7–1.4 µs average processing latency under load
+**Latency:** 0.05–0.45 µs average processing latency under load
 
-**Memory:** ~16MB at 10,000 concurrent connections (Tokio tasks, not OS threads)
+**Memory:** ~43MB at 10,000 concurrent connections (Tokio tasks, not OS threads)
 
-**DashMap vs Mutex under 8 concurrent threads:** 2.5ms vs 31.2ms — **12.4× faster**
+**DashMap vs Mutex end-to-end (8 workers):** 0.45 µs vs 3.90 µs — **8.7× lower latency**
 
-Full results in [BENCHMARKS.md](BENCHMARKS.md).
+**DashMap vs Mutex isolated (Criterion, 8 threads):** 2.51ms vs 31.18ms — **12.4× faster**
+
+Full results: [BENCHMARKS.md](BENCHMARKS.md)
 
 ---
 
@@ -59,16 +61,22 @@ Full results in [BENCHMARKS.md](BENCHMARKS.md).
 # Build
 cargo build --release
 
-# Run with 4 sharded workers
-cargo run --release -- --workers 4 --capacity 5000
+# macOS: raise file descriptor limit for high connection counts
+ulimit -n 65536
+
+# Run with 8 sharded workers
+cargo run --release -- --workers 8 --capacity 5000
 
 # Send a test message
 echo '{"timestamp":"2024-01-15T09:30:00Z","account_id":"acc_0001","amount":100.0,"type":"deposit","currency":"USD"}' | nc localhost 8080
 
-# Run stress test (requires server running in another terminal)
-python3 tools/stress_test.py --clients 1000 --messages 100
+# Rust load generator (accurate throughput measurement)
+cargo run --release --bin load_gen -- --clients 1000 --messages 1000
 
-# Run Criterion benchmarks (no server needed)
+# Python stress tester (no build required)
+python3 tools/stress_test.py --clients 100 --messages 100
+
+# Criterion micro-benchmarks (no server needed)
 cargo bench
 ```
 
@@ -86,35 +94,36 @@ cargo bench
 
 ## Key Engineering Decisions
 
-**Why Tokio async tasks per connection, not OS threads?**  
-OS threads consume ~8MB each. At 10,000 connections that's 80GB — impossible.
+**Why Tokio async tasks per connection, not OS threads?**
+OS threads consume ~8MB each. At 10,000 connections that's 80GB.
 Tokio tasks are ~KB each, multiplexed across a small thread pool. This is how
-production servers (nginx, Node.js) handle connection scale.
+production servers handle connection scale. Measured result: ~43MB at 10,000
+concurrent connections.
 
-**Why bounded channels?**  
-An unbounded channel lets producers run ahead of consumers indefinitely —
-memory grows without limit under load until the process is OOM-killed.
-A bounded channel blocks the producer when full, propagating backpressure to
-the client. The server stays stable under any load; clients slow down instead
-of the server crashing.
+**Why bounded channels?**
+An unbounded channel lets producers run ahead of consumers indefinitely so memory
+grows without limit until OOM. A bounded channel blocks the producer when full,
+propagating backpressure to the client. The server stays stable under any load.
+Measured result: 0% error rate across all tested capacities and client counts.
 
-**Why account_id hash routing to shards?**  
-If all workers share one DashMap, writes to the same account from different
-workers still contend on that entry's shard. By routing `acc_0001` always to
-worker 0 and `acc_0042` always to worker 2, each worker exclusively owns its
-accounts. Zero cross-worker contention, regardless of write volume.
+**Why account_id hash routing to worker shards?**
+If all workers share one aggregator, writes to the same account from different
+workers contend. By routing `acc_0001` always to worker 0 and `acc_0042` always
+to worker 2, each worker exclusively owns its accounts: zero cross-worker
+contention regardless of write volume.
 
-**Why DashMap over Mutex\<HashMap\>?**  
-Under single-threaded access they're identical (133 ns vs 139 ns). Under 8
-concurrent threads, Mutex serializes all writes through one lock: 12.4× slower
-than DashMap's internal sharding. The Criterion benchmarks demonstrate this
-directly: `concurrent_insert/dashmap` = 2.51ms, `concurrent_insert/mutex` = 31.18ms.
+**Why DashMap over Mutex\<HashMap\>?**
+Single-threaded they're identical (133 ns vs 139 ns). Under 8 concurrent threads,
+Mutex serializes all writes through one lock — 8.7× higher latency end-to-end,
+12.4× slower in isolated Criterion benchmarks. The difference grows with thread
+count. DashMap's internal sharding lets threads write to different accounts
+simultaneously without blocking each other.
 
-**Why crossbeam channels for worker queues, not tokio mpsc?**  
-Worker threads are synchronous — they loop, process, repeat. There's no need
-for async. `crossbeam::bounded` is a high-performance sync channel purpose-built
-for this pattern. Using `tokio::sync::mpsc` in a sync thread would require
-`.blocking_recv()` which adds overhead and muddies the async/sync boundary.
+**Why crossbeam channels for worker queues, not tokio mpsc?**
+Worker threads are synchronous menaing they loop, process, repeat. There's no need for async. `crossbeam::bounded` is a high-performance sync channel purpose-built for this pattern. Using `tokio::sync::mpsc` in a sync thread requires `.blocking_recv()` which adds overhead and muddies the async/sync boundary.
+
+**Why a Rust load generator instead of Python?**
+Python's async client caps at ~13k msg/sec on localhost due to interpreter overhead. The Rust load generator (`src/bin/load_gen.rs`) removes this bottleneck entirely, revealing true server throughput. The Python tester (`tools/stress_test.py`) remains useful for validating the server works with any TCP client.
 
 ---
 
@@ -122,20 +131,22 @@ for this pattern. Using `tokio::sync::mpsc` in a sync thread would require
 
 ```
 src/
-  main.rs           — CLI config, runtime init, module wiring
-  server.rs         — Tokio TCP listener, one task per connection
-  worker.rs         — Single-task baseline + sharded thread pool
-  aggregator.rs     — DashMap concurrent aggregator
-  aggregator_mutex.rs — Mutex<HashMap> aggregator (for benchmarking)
-  message.rs        — LogEntry, EntryType, AccountStats structs
-  metrics.rs        — AtomicU64 counters, 5-second throughput reporter
-  lib.rs            — Re-exports for Criterion benchmarks
+  main.rs              — CLI config, runtime init, module wiring
+  server.rs            — Tokio TCP listener, one task per connection
+  worker.rs            — Single-task baseline + sharded thread pool
+  aggregator.rs        — DashMap concurrent aggregator
+  aggregator_mutex.rs  — Mutex<HashMap> aggregator (benchmarking only)
+  message.rs           — LogEntry, EntryType, AccountStats structs
+  metrics.rs           — AtomicU64 counters, 5-second throughput reporter
+  lib.rs               — Re-exports for Criterion benchmarks
+  bin/
+    load_gen.rs        — Rust async load generator (BufWriter batching)
 
 benches/
-  processing.rs     — Criterion: parse, process, concurrent insert
+  processing.rs        — Criterion: parse, process, concurrent insert
 
 tools/
-  stress_test.py    — Async Python TCP client, N concurrent connections
+  stress_test.py       — Python async TCP client, N concurrent connections
 ```
 
 ---
